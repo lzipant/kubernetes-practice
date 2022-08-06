@@ -1,0 +1,189 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: lzipant
+spec:
+  selector:
+    matchLabels:
+      # 适用于所有label包括app=mysql的pod
+      app: mysql
+  serviceName: mysql
+  replicas: 3
+
+  #  定义pod
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      # 在init容器中为pod中的mysql容器做初始化工作
+      initContainers:
+        # init-mysql容器会分配pod的角色是master还是slave, 然后生成配置文件
+        - name: init-mysql
+          image: mysql:5.7
+          command:
+            - bash
+            - "-c"
+            - |
+              set -ex
+              # 生成server-id
+              [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+              ordinal=${BASH_REMATCH[1]}
+              echo [mysqld] > /mnt/conf.d/server-id.cnf
+              # 写入server-id
+              echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+              # server-id尾号为0作为master, 否则作为slave
+              # 这里cp到pod中的cnf会与server-id.cnf一块被mysql.cnf  include进去
+              # 这里指定了序号为0的pod会作为master节点提供写, 其他pod作为slave节点提供读
+              if [[ $ordinal -eq 0 ]]; then
+                cp /mnt/config-map/master.cnf /mnt/conf.d/
+              else
+                cp /mnt/config-map/slave.cnf /mnt/conf.d/
+              fi
+          volumeMounts:
+            # 将conf临时卷挂载到了pod的/mnt/conf.d路径下
+            - name: conf
+              mountPath: /mnt/conf.d
+            # 这里把ConfigMap中的配置怪哉到了pod的/mnt/config-map路径下
+            - name: config-map
+              mountPath: /mnt/config-map
+        # 这一个init容器会正在pod启动时假定之前已经存在数据, 并将之前的数据复制过来, 以确保新pod中有数据可以提供使用
+        - name: clone-mysql
+          # xtrabackup是一个开源工具, 用于克隆mysql的数据
+          image: ist0ne/xtrabackup:latest
+          command:
+            - bash
+            - "-c"
+            - |
+              set -ex
+              # Skip the clone if data already exists.
+              [[ -d /var/lib/mysql/mysql ]] && exit 0
+              # Skip the clone on master (ordinal index 0).
+              [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+              ordinal=${BASH_REMATCH[1]}
+              [[ $ordinal -eq 0 ]] && exit 0
+              # Clone data from previous peer.
+              ncat --recv-only mysql-$(($ordinal-1)).mysql 3307 | xbstream -x -C /var/lib/mysql
+              # Prepare the backup.
+              xtrabackup --prepare --target-dir=/var/lib/mysql
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+              subPath: mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+      containers:
+        # 实际运行mysqld服务的mysql容器
+        - name: mysql
+          image: mysql:5.7
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: "abcdef"
+          ports:
+            - name: mysql
+              containerPort: 3306
+          volumeMounts:
+            # 将data卷的mysql目录挂在到容器的/var/lib/mysql
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+              subPath: mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          # 启动存活探针, 如果失败会重启pod
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          # 启动就绪探针确保容器的运行正常, 如果有失败会将pod从service关联的endpoint中剔除
+          readinessProbe:
+            exec:
+              # Check we can execute queries over TCP (skip-networking is off).
+              command: ["mysql", "-h", "127.0.0.1", "-e", "SELECT 1"]
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            timeoutSeconds: 1
+        # init结束后还会在启动一个xtrabackup容器作为mysqld容器的sidecar运行
+        - name: xtrabackup
+          image: ist0ne/xtrabackup:latest
+          ports:
+            - name: xtrabackup
+              containerPort: 3307
+          command:
+            - bash
+            - "-c"
+            - |
+              set -ex
+              cd /var/lib/mysql
+              # 他会在启动时查看之前是否有数据克隆文件存在, 如果有那就去其他从节点复制数据, 如果没有就去主节点复制数据
+              # Determine binlog position of cloned data, if any.
+              if [[ -f xtrabackup_slave_info && "x$(<xtrabackup_slave_info)" != "x" ]]; then
+                # XtraBackup already generated a partial "CHANGE MASTER TO" query
+                # because we're cloning from an existing slave. (Need to remove the tailing semicolon!)
+                cat xtrabackup_slave_info | sed -E 's/;$//g' > change_master_to.sql.in
+                # Ignore xtrabackup_binlog_info in this case (it's useless).
+                rm -f xtrabackup_slave_info xtrabackup_binlog_info
+              elif [[ -f xtrabackup_binlog_info ]]; then
+                # We're cloning directly from master. Parse binlog position.
+                [[ `cat xtrabackup_binlog_info` =~ ^(.*?)[[:space:]]+(.*?)$ ]] || exit 1
+                rm -f xtrabackup_binlog_info xtrabackup_slave_info
+                echo "CHANGE MASTER TO MASTER_LOG_FILE='${BASH_REMATCH[1]}',\
+                      MASTER_LOG_POS=${BASH_REMATCH[2]}" > change_master_to.sql.in
+              fi
+
+              # Check if we need to complete a clone by starting replication.
+              if [[ -f change_master_to.sql.in ]]; then
+                echo "Waiting for mysqld to be ready (accepting connections)"
+                until mysql -h 127.0.0.1 -e "SELECT 1"; do sleep 1; done
+
+                echo "Initializing replication from clone position"
+                mysql -h 127.0.0.1 \
+                      -e "$(<change_master_to.sql.in), \
+                              MASTER_HOST='mysql-0.mysql', \
+                              MASTER_USER='root', \
+                              MASTER_PASSWORD='', \
+                              MASTER_CONNECT_RETRY=10; \
+                            START SLAVE;" || exit 1
+                # In case of container restart, attempt this at-most-once.
+                mv change_master_to.sql.in change_master_to.sql.orig
+              fi
+
+              # Start a server to send backups when requested by peers.
+              exec ncat --listen --keep-open --send-only --max-conns=1 3307 -c \
+                "xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root"
+          volumeMounts:
+            # 将data卷的mysql目录挂在到容器的/var/lib/mysql
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+              subPath: mysql
+            - name: conf
+              mountPath: /etc/mysql/conf.d
+      volumes:
+        - name: conf
+          # pod在节点上被移除时, emptyDir会同时被删除
+          # emptyDir一般被用作缓存目录,  这里用在config
+          emptyDir: {}
+        - name: config-map
+          # ConfigMap对象中存储的数据可以被configMap类型的卷引用, 然后被Pod中运行的容器使用
+          # 这里引用了前面定义了名称为mysql的ConfigMap对象
+          configMap:
+            name: mysql
+  volumeClaimTemplates:
+    # 这里面定义的是对PVC的模板, 这里没有单独为mysql创建pvc, 而是动态创建的
+    - metadata:
+        name: mysql-data
+        namespace: lzipant
+        annotations:
+          volume.beta.kubernetes.io/storage-class: "managed-nfs-storage"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
